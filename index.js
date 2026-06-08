@@ -8,11 +8,24 @@ const PORT = process.env.PORT || 3000;
 // Pointing to your local Python heuristics engine
 const PYTHON_ENGINE_URL = process.env.ENGINE_URL || 'http://127.0.0.1:8000/api/v1/analyze';
 
-// mock arkada global rank check
+// Mock Arkada Global Rank Service
 const checkArkadaRank = async (walletAddress) => {
-    // prod: ping the Arkada contract/API on X1 EcoChain
-    // mock: assume unverified to force the heavy heuristics check
-    return { isVerified: false, rank: 0 };
+    console.log(`[Arkada Mock] Simulating reputation check for ${walletAddress}...`);
+    
+    // 1. Simulate real-world network/RPC latency (50ms - 150ms)
+    const latency = Math.floor(Math.random() * 100) + 50;
+    await new Promise(resolve => setTimeout(resolve, latency));
+
+    // 2. Routing Logic Test: 
+    // If we pass a wallet starting with '0xTRUST', simulate a high-reputation user
+    if (walletAddress && walletAddress.startsWith('0xTRUST')) {
+        console.log(`[Arkada Mock] Wallet verified. Rank: 85`);
+        return { isVerified: true, rank: 85 };
+    }
+    
+    // 3. Default: Simulate low/no reputation to force the Python Heuristics check
+    console.log(`[Arkada Mock] Wallet unverified. Routing to deep heuristics...`);
+    return { isVerified: false, rank: 12 };
 };
 
 app.post('/api/verify', async (req, res) => {
