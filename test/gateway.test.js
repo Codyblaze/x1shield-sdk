@@ -70,7 +70,13 @@ test('gateway sends the engine { walletAddress, fingerprint } (regression guard)
     assert.ok(lastEngineBody, 'engine should have been called');
     assert.deepEqual(Object.keys(lastEngineBody).sort(), ['fingerprint', 'walletAddress']);
     assert.equal(lastEngineBody.walletAddress, VALID_WALLET);
-    assert.deepEqual(lastEngineBody.fingerprint, FINGERPRINT);
+    assert.deepEqual(
+        lastEngineBody.fingerprint.interactionSequence,
+        FINGERPRINT.interactionSequence
+    );
+    assert.equal(lastEngineBody.fingerprint.accountAgeDays, FINGERPRINT.accountAgeDays);
+    // Gateway injects the server-observed source IP on every request.
+    assert.equal(typeof lastEngineBody.fingerprint.network.ip_address, 'string');
 });
 
 test('healthy engine approval -> 200 approved / heuristics_cleared', async () => {
@@ -111,4 +117,56 @@ test('engine error -> 503 fail-closed', async () => {
     assert.equal(res.status, 503);
     assert.equal(res.data.status, 'rejected');
     assert.equal(res.data.reason, 'verification_unavailable');
+});
+
+test('nested browser_data + network pass validation; spoofed IP is overridden', async () => {
+    const nestedFp = {
+        interaction_sequence: ['connect', 'swap'],
+        browser_data: {
+            user_agent: 'Mozilla/5.0',
+            fonts: ['Arial', 'Calibri'],
+        },
+        network: {
+            ip_address: '52.1.2.3', // attacker-claimed; must be ignored
+            recent_ips: ['52.1.2.3', '52.1.2.4'],
+        },
+    };
+
+    const res = await gateway.post('/api/verify', {
+        walletAddress: VALID_WALLET,
+        fingerprint: nestedFp,
+    });
+
+    assert.equal(res.status, 200);
+    assert.deepEqual(lastEngineBody.fingerprint.browser_data, nestedFp.browser_data);
+    assert.deepEqual(lastEngineBody.fingerprint.network.recent_ips, nestedFp.network.recent_ips);
+    // The caller's claimed ip_address is replaced by the server-observed one.
+    assert.notEqual(lastEngineBody.fingerprint.network.ip_address, '52.1.2.3');
+    assert.equal(typeof lastEngineBody.fingerprint.network.ip_address, 'string');
+});
+
+test('disallowed nested object is rejected with 400', async () => {
+    const res = await gateway.post('/api/verify', {
+        walletAddress: VALID_WALLET,
+        fingerprint: { metadata: { evil: true } },
+    });
+
+    assert.equal(res.status, 400);
+    assert.equal(res.data.reason, 'invalid_input');
+});
+
+test('prototype-pollution key inside allowed sub-object is rejected', async () => {
+    // Sent as a raw string so "__proto__" survives JSON.parse as a real own key
+    // (an object literal would treat it as the prototype and drop it).
+    const raw = JSON.stringify({
+        walletAddress: VALID_WALLET,
+        fingerprint: { network: {} },
+    }).replace('"network":{}', '"network":{"__proto__":{"polluted":true}}');
+
+    const res = await gateway.post('/api/verify', raw, {
+        headers: { 'Content-Type': 'application/json' },
+    });
+
+    assert.equal(res.status, 400);
+    assert.equal(res.data.reason, 'invalid_input');
 });
