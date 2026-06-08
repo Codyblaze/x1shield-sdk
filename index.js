@@ -6,9 +6,6 @@ const http = require('http');
 const https = require('https');
 const crypto = require('crypto');
 
-// ---------------------------------------------------------------------------
-// Config (fail-fast on missing required env in production)
-// ---------------------------------------------------------------------------
 const PORT = Number(process.env.PORT) || 3000;
 const PYTHON_ENGINE_URL =
     process.env.ENGINE_URL || 'http://127.0.0.1:8000/api/v1/analyze';
@@ -17,7 +14,7 @@ const ARKADA_TIMEOUT_MS = Number(process.env.ARKADA_TIMEOUT_MS) || 800;
 const ARKADA_RANK_THRESHOLD = Number(process.env.ARKADA_RANK_THRESHOLD) || 50;
 const MAX_BODY_BYTES = process.env.MAX_BODY_BYTES || '32kb';
 const RATE_LIMIT_WINDOW_MS = Number(process.env.RATE_LIMIT_WINDOW_MS) || 60_000;
-const RATE_LIMIT_MAX = Number(process.env.RATE_LIMIT_MAX) || 60; // per IP per window
+const RATE_LIMIT_MAX = Number(process.env.RATE_LIMIT_MAX) || 60;
 const API_KEYS = (process.env.API_KEYS || '')
     .split(',')
     .map((k) => k.trim())
@@ -25,7 +22,6 @@ const API_KEYS = (process.env.API_KEYS || '')
 const IS_PROD = process.env.NODE_ENV === 'production';
 
 if (IS_PROD && !process.env.ENGINE_URL) {
-    // Refuse to silently call localhost in production.
     // eslint-disable-next-line no-console
     console.error('FATAL: ENGINE_URL must be set explicitly in production.');
     process.exit(1);
@@ -36,9 +32,6 @@ if (IS_PROD && API_KEYS.length === 0) {
     process.exit(1);
 }
 
-// ---------------------------------------------------------------------------
-// Tiny structured logger (no extra deps)
-// ---------------------------------------------------------------------------
 const log = (level, msg, fields = {}) => {
     // eslint-disable-next-line no-console
     console.log(
@@ -46,9 +39,6 @@ const log = (level, msg, fields = {}) => {
     );
 };
 
-// ---------------------------------------------------------------------------
-// Keep-alive HTTP agents for downstream calls
-// ---------------------------------------------------------------------------
 const httpAgent = new http.Agent({ keepAlive: true, maxSockets: 50 });
 const httpsAgent = new https.Agent({ keepAlive: true, maxSockets: 50 });
 const engineClient = axios.create({
@@ -56,14 +46,12 @@ const engineClient = axios.create({
     timeout: ENGINE_TIMEOUT_MS,
     httpAgent,
     httpsAgent,
-    // Treat any non-2xx as an error so we hit the catch path explicitly
+    // Any non-2xx must reach the catch path so a degraded engine fails closed.
     validateStatus: (s) => s >= 200 && s < 300,
 });
 
-// ---------------------------------------------------------------------------
-// Naive per-IP rate limiter (in-memory; swap for Redis in multi-instance)
-// ---------------------------------------------------------------------------
-const rateBuckets = new Map(); // ip -> { count, resetAt }
+// In-memory limiter; swap for Redis once the gateway runs multi-instance.
+const rateBuckets = new Map();
 const rateLimit = (req, res, next) => {
     const ip = req.ip || req.socket.remoteAddress || 'unknown';
     const now = Date.now();
@@ -82,7 +70,6 @@ const rateLimit = (req, res, next) => {
     return next();
 };
 
-// Periodically prune stale buckets so the Map doesn't grow unbounded.
 setInterval(() => {
     const now = Date.now();
     for (const [ip, b] of rateBuckets) {
@@ -90,11 +77,8 @@ setInterval(() => {
     }
 }, RATE_LIMIT_WINDOW_MS).unref();
 
-// ---------------------------------------------------------------------------
-// API-key auth (constant-time compare)
-// ---------------------------------------------------------------------------
 const requireApiKey = (req, res, next) => {
-    // Allow unauthenticated calls only outside production AND when no keys configured.
+    // Auth is bypassable only when unconfigured outside production.
     if (!IS_PROD && API_KEYS.length === 0) return next();
 
     const provided = req.get('x-api-key') || '';
@@ -114,9 +98,6 @@ const requireApiKey = (req, res, next) => {
     return next();
 };
 
-// ---------------------------------------------------------------------------
-// Request ID middleware
-// ---------------------------------------------------------------------------
 const attachRequestId = (req, res, next) => {
     const incoming = req.get('x-request-id');
     req.id = incoming && /^[a-zA-Z0-9_-]{1,64}$/.test(incoming)
@@ -126,9 +107,6 @@ const attachRequestId = (req, res, next) => {
     next();
 };
 
-// ---------------------------------------------------------------------------
-// Input validation
-// ---------------------------------------------------------------------------
 const EVM_ADDRESS_RE = /^0x[a-fA-F0-9]{40}$/;
 const MAX_FINGERPRINT_KEYS = 64;
 const MAX_FINGERPRINT_STRING_LEN = 2048;
@@ -143,8 +121,7 @@ const validateFingerprint = (fp) => {
     if (keys.length > MAX_FINGERPRINT_KEYS) return 'fingerprint_too_many_keys';
     for (const k of keys) {
         const v = fp[k];
-        // Only allow primitives or shallow arrays of primitives — no nested objects.
-        // This blocks prototype pollution payloads and keeps the schema flat.
+        // Flat schema only: blocks prototype-pollution payloads and nested abuse.
         if (k === '__proto__' || k === 'constructor' || k === 'prototype') {
             return 'fingerprint_forbidden_key';
         }
@@ -177,10 +154,7 @@ const validateVerifyBody = (body) => {
     return null;
 };
 
-// ---------------------------------------------------------------------------
-// Arkada reputation client (mock — gated to non-prod)
-// ---------------------------------------------------------------------------
-const arkadaCache = new Map(); // address -> { value, expiresAt }
+const arkadaCache = new Map();
 const ARKADA_CACHE_TTL_MS = 60_000;
 const ARKADA_CACHE_MAX = 5_000;
 
@@ -195,7 +169,7 @@ const cacheGet = (addr) => {
 };
 const cacheSet = (addr, value) => {
     if (arkadaCache.size >= ARKADA_CACHE_MAX) {
-        // Drop the oldest entry (Maps preserve insertion order)
+        // Evict oldest; Map iteration follows insertion order.
         const firstKey = arkadaCache.keys().next().value;
         if (firstKey !== undefined) arkadaCache.delete(firstKey);
     }
@@ -206,7 +180,6 @@ const checkArkadaRank = async (walletAddress, { signal } = {}) => {
     const cached = cacheGet(walletAddress);
     if (cached) return cached;
 
-    // --- MOCK BLOCK: only active outside production ---
     if (!IS_PROD) {
         const latency = Math.floor(Math.random() * 100) + 50;
         await new Promise((resolve, reject) => {
@@ -218,27 +191,21 @@ const checkArkadaRank = async (walletAddress, { signal } = {}) => {
                 }, { once: true });
             }
         });
-        // NOTE: the prior `0xTRUST` bypass has been REMOVED. Mocks must never
-        // grant trust based on attacker-controlled input shape.
+        // Mock must never grant trust off attacker-controlled input.
         const value = { isVerified: false, rank: 12, source: 'mock' };
         cacheSet(walletAddress, value);
         return value;
     }
 
-    // --- PROD BLOCK: real client must be wired here ---
     throw new Error('arkada_client_not_configured');
 };
 
-// ---------------------------------------------------------------------------
-// Express app
-// ---------------------------------------------------------------------------
 const app = express();
 app.disable('x-powered-by');
 app.set('trust proxy', Number(process.env.TRUST_PROXY_HOPS) || 0);
 app.use(express.json({ limit: MAX_BODY_BYTES }));
 app.use(attachRequestId);
 
-// Body-parser errors (e.g. payload too large, malformed JSON)
 app.use((err, req, res, next) => {
     if (err && err.type === 'entity.too.large') {
         return res.status(413).json({ status: 'rejected', reason: 'payload_too_large' });
@@ -249,19 +216,16 @@ app.use((err, req, res, next) => {
     return next(err);
 });
 
-// Health endpoints
 app.get('/health', (_req, res) => res.json({ ok: true }));
 app.get('/ready', async (_req, res) => {
-    // Light readiness check — does NOT call the engine to avoid amplification.
+    // Deliberately skips the engine to avoid readiness-probe amplification.
     res.json({ ok: true, engine: PYTHON_ENGINE_URL });
 });
 
-// Main verify route
 app.post('/api/verify', rateLimit, requireApiKey, async (req, res) => {
     const reqId = req.id;
     const startedAt = Date.now();
 
-    // 1) Validate input BEFORE any downstream call.
     const validationError = validateVerifyBody(req.body);
     if (validationError) {
         log('warn', 'verify.invalid_input', { reqId, code: validationError });
@@ -274,8 +238,7 @@ app.post('/api/verify', rateLimit, requireApiKey, async (req, res) => {
 
     const { walletAddress, fingerprint } = req.body;
 
-    // 2) Fire Arkada and the engine IN PARALLEL.
-    //    If Arkada returns a confident approval, we abort the engine call.
+    // Race Arkada against the engine; a confident Arkada pass cancels the engine.
     const engineAbort = new AbortController();
     const arkadaAbort = new AbortController();
 
@@ -298,7 +261,7 @@ app.post('/api/verify', rateLimit, requireApiKey, async (req, res) => {
 
     const enginePromise = (async () => {
         try {
-            const r = await engineClient.post('', fingerprint, {
+            const r = await engineClient.post('', { walletAddress, fingerprint }, {
                 signal: engineAbort.signal,
                 headers: { 'x-request-id': reqId },
             });
@@ -308,7 +271,6 @@ app.post('/api/verify', rateLimit, requireApiKey, async (req, res) => {
         }
     })();
 
-    // 3) Wait for Arkada first (cheap path). If confident, cancel engine.
     const arkada = await arkadaPromise;
     if (
         arkada.ok &&
@@ -331,7 +293,6 @@ app.post('/api/verify', rateLimit, requireApiKey, async (req, res) => {
         });
     }
 
-    // 4) Otherwise, the engine result is authoritative.
     const engine = await enginePromise;
     if (!engine.ok) {
         log('error', 'verify.engine_unavailable', {
@@ -339,7 +300,7 @@ app.post('/api/verify', rateLimit, requireApiKey, async (req, res) => {
             err: engine.error,
             durMs: Date.now() - startedAt,
         });
-        // Fail CLOSED: an unavailable engine must not approve traffic.
+        // Fail closed: an unavailable engine must never approve traffic.
         return res.status(503).json({
             status: 'rejected',
             reason: 'verification_unavailable',
@@ -348,11 +309,10 @@ app.post('/api/verify', rateLimit, requireApiKey, async (req, res) => {
     }
 
     const data = engine.value;
-    // 5) Strict, default-deny check on the engine response shape.
     if (!isPlainObject(data) || data.is_human !== true) {
         log('info', 'verify.rejected', {
             reqId,
-            // flags / risk_score are logged server-side only, NEVER returned to client.
+            // Scores/flags stay server-side; detection internals are never returned.
             flags: Array.isArray(data && data.flags) ? data.flags : undefined,
             risk_score: data && data.risk_score,
             arkadaRank: arkada.ok ? arkada.value.rank : null,
@@ -361,7 +321,7 @@ app.post('/api/verify', rateLimit, requireApiKey, async (req, res) => {
         return res.status(403).json({
             status: 'rejected',
             reason: 'sybil_detected',
-            ref: reqId, // caller can quote this ref for support; no internals leaked
+            ref: reqId,
         });
     }
 
@@ -378,7 +338,6 @@ app.post('/api/verify', rateLimit, requireApiKey, async (req, res) => {
     });
 });
 
-// Catch-all error handler (last line of defense — never leak stack traces)
 // eslint-disable-next-line no-unused-vars
 app.use((err, req, res, _next) => {
     log('error', 'unhandled_error', {
@@ -388,24 +347,23 @@ app.use((err, req, res, _next) => {
     res.status(500).json({ status: 'rejected', reason: 'internal_error', ref: req.id });
 });
 
-// ---------------------------------------------------------------------------
-// Boot
-// ---------------------------------------------------------------------------
-const server = app.listen(PORT, () => {
-    log('info', 'startup', {
-        port: PORT,
-        engine: PYTHON_ENGINE_URL,
-        prod: IS_PROD,
+// Bind a port only when run directly so test imports stay side-effect free.
+if (require.main === module) {
+    const server = app.listen(PORT, () => {
+        log('info', 'startup', {
+            port: PORT,
+            engine: PYTHON_ENGINE_URL,
+            prod: IS_PROD,
+        });
     });
-});
 
-// Graceful shutdown so in-flight verifies complete.
-const shutdown = (sig) => {
-    log('info', 'shutdown', { sig });
-    server.close(() => process.exit(0));
-    setTimeout(() => process.exit(1), 10_000).unref();
-};
-process.on('SIGTERM', () => shutdown('SIGTERM'));
-process.on('SIGINT', () => shutdown('SIGINT'));
+    const shutdown = (sig) => {
+        log('info', 'shutdown', { sig });
+        server.close(() => process.exit(0));
+        setTimeout(() => process.exit(1), 10_000).unref();
+    };
+    process.on('SIGTERM', () => shutdown('SIGTERM'));
+    process.on('SIGINT', () => shutdown('SIGINT'));
+}
 
 module.exports = app;
