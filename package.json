@@ -1,0 +1,24 @@
+{
+  "name": "x1shield-sdk",
+  "version": "1.0.0",
+  "description": "The middleware layer for X1 Shield. This Express service acts as the logic gate for dApps on the X1 EcoChain.",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Codyblaze/x1shield-sdk.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "bugs": {
+    "url": "https://github.com/Codyblaze/x1shield-sdk/issues"
+  },
+  "homepage": "https://github.com/Codyblaze/x1shield-sdk#readme",
+  "dependencies": {
+    "axios": "^1.16.1",
+    "express": "^5.2.1"
+  }
+}
