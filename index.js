@@ -114,17 +114,23 @@ const MAX_FINGERPRINT_STRING_LEN = 2048;
 const isPlainObject = (v) =>
     v !== null && typeof v === 'object' && !Array.isArray(v);
 
-const validateFingerprint = (fp) => {
-    if (!isPlainObject(fp)) return 'fingerprint_must_be_object';
-    const keys = Object.keys(fp);
-    if (keys.length === 0) return 'fingerprint_empty';
+// Known sub-objects allowed to nest exactly one level (snake_case + camelCase).
+const ALLOWED_NESTED_KEYS = new Set([
+    'browser_data',
+    'browserData',
+    'network',
+]);
+
+const isForbiddenKey = (k) =>
+    k === '__proto__' || k === 'constructor' || k === 'prototype';
+
+// Validates a single flat level: primitives or arrays of primitives only.
+const validateFlatLevel = (obj) => {
+    const keys = Object.keys(obj);
     if (keys.length > MAX_FINGERPRINT_KEYS) return 'fingerprint_too_many_keys';
     for (const k of keys) {
-        const v = fp[k];
-        // Flat schema only: blocks prototype-pollution payloads and nested abuse.
-        if (k === '__proto__' || k === 'constructor' || k === 'prototype') {
-            return 'fingerprint_forbidden_key';
-        }
+        if (isForbiddenKey(k)) return 'fingerprint_forbidden_key';
+        const v = obj[k];
         if (Array.isArray(v)) {
             if (v.length > MAX_FINGERPRINT_KEYS) return 'fingerprint_array_too_long';
             for (const item of v) {
@@ -137,6 +143,36 @@ const validateFingerprint = (fp) => {
             }
         } else if (v !== null && typeof v === 'object') {
             return 'fingerprint_nested_object';
+        } else if (typeof v === 'string' && v.length > MAX_FINGERPRINT_STRING_LEN) {
+            return 'fingerprint_string_too_long';
+        }
+    }
+    return null;
+};
+
+const validateFingerprint = (fp) => {
+    if (!isPlainObject(fp)) return 'fingerprint_must_be_object';
+    const keys = Object.keys(fp);
+    if (keys.length === 0) return 'fingerprint_empty';
+    if (keys.length > MAX_FINGERPRINT_KEYS) return 'fingerprint_too_many_keys';
+    for (const k of keys) {
+        if (isForbiddenKey(k)) return 'fingerprint_forbidden_key';
+        const v = fp[k];
+        if (Array.isArray(v)) {
+            if (v.length > MAX_FINGERPRINT_KEYS) return 'fingerprint_array_too_long';
+            for (const item of v) {
+                if (item !== null && typeof item === 'object') {
+                    return 'fingerprint_nested_object';
+                }
+                if (typeof item === 'string' && item.length > MAX_FINGERPRINT_STRING_LEN) {
+                    return 'fingerprint_string_too_long';
+                }
+            }
+        } else if (v !== null && typeof v === 'object') {
+            // Only whitelisted sub-objects may nest, and only one level deep.
+            if (!ALLOWED_NESTED_KEYS.has(k)) return 'fingerprint_nested_object';
+            const nestedErr = validateFlatLevel(v);
+            if (nestedErr) return nestedErr;
         } else if (typeof v === 'string' && v.length > MAX_FINGERPRINT_STRING_LEN) {
             return 'fingerprint_string_too_long';
         }
@@ -237,6 +273,13 @@ app.post('/api/verify', rateLimit, requireApiKey, async (req, res) => {
     }
 
     const { walletAddress, fingerprint } = req.body;
+
+    // The source IP must come from the connection, not the caller. A client
+    // could otherwise claim a residential IP to dodge datacenter detection.
+    fingerprint.network = {
+        ...(isPlainObject(fingerprint.network) ? fingerprint.network : {}),
+        ip_address: req.ip,
+    };
 
     // Race Arkada against the engine; a confident Arkada pass cancels the engine.
     const engineAbort = new AbortController();

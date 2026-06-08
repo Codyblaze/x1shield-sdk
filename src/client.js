@@ -62,6 +62,14 @@ class X1ShieldClient {
             };
         }
 
+        if (fp.network) {
+            const n = fp.network;
+            engineFp.network = {
+                ip_address: n.ipAddress ?? null,
+                recent_ips: n.recentIps ?? [],
+            };
+        }
+
         return engineFp;
     }
 
