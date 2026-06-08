@@ -4,7 +4,10 @@
   "description": "The middleware layer for X1 Shield. This Express service acts as the logic gate for dApps on the X1 EcoChain.",
   "main": "index.js",
   "scripts": {
-    "test": "node --test"
+    "start": "node index.js",
+    "test": "node --test",
+    "bench": "node benchmark.js",
+    "demo:nubica": "node scripts/nubica_demo.js"
   },
   "repository": {
     "type": "git",
@@ -19,6 +22,11 @@
   "homepage": "https://github.com/Codyblaze/x1shield-sdk#readme",
   "dependencies": {
     "axios": "^1.7.7",
-    "express": "^4.21.1"
+    "ethers": "^6.16.0",
+    "express": "^4.21.1",
+    "ioredis": "^5.11.1"
+  },
+  "devDependencies": {
+    "autocannon": "^8.0.0"
   }
 }

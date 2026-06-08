@@ -2,6 +2,7 @@
 
 const express = require('express');
 const axios = require('axios');
+const Redis = require('ioredis');
 const http = require('http');
 const https = require('https');
 const crypto = require('crypto');
@@ -15,6 +16,9 @@ const ARKADA_RANK_THRESHOLD = Number(process.env.ARKADA_RANK_THRESHOLD) || 50;
 const MAX_BODY_BYTES = process.env.MAX_BODY_BYTES || '32kb';
 const RATE_LIMIT_WINDOW_MS = Number(process.env.RATE_LIMIT_WINDOW_MS) || 60_000;
 const RATE_LIMIT_MAX = Number(process.env.RATE_LIMIT_MAX) || 60;
+const REDIS_URL = process.env.REDIS_URL || 'redis://127.0.0.1:6379';
+const CACHE_TTL_SECONDS = Number(process.env.CACHE_TTL_SECONDS) || 60;
+const CACHE_KEY_PREFIX = 'x1shield:verdict:';
 const API_KEYS = (process.env.API_KEYS || '')
     .split(',')
     .map((k) => k.trim())
@@ -49,6 +53,53 @@ const engineClient = axios.create({
     // Any non-2xx must reach the catch path so a degraded engine fails closed.
     validateStatus: (s) => s >= 200 && s < 300,
 });
+
+let lastRedisErrorLogAt = 0;
+const redis = new Redis(REDIS_URL, {
+    lazyConnect: true,
+    // enableOfflineQueue:false makes commands reject immediately while the
+    // socket is down instead of buffering, so a dead Redis never blocks the
+    // verification hot path and the gateway bypasses straight to the engine.
+    enableOfflineQueue: false,
+    maxRetriesPerRequest: 1,
+    connectTimeout: 500,
+    retryStrategy: (times) => Math.min(times * 200, 5_000),
+});
+redis.on('error', (err) => {
+    const now = Date.now();
+    if (now - lastRedisErrorLogAt > 10_000) {
+        lastRedisErrorLogAt = now;
+        log('warn', 'redis.unavailable', { err: err && err.message });
+    }
+});
+
+const isCacheReady = () => redis.status === 'ready';
+
+const verdictCacheKey = (walletAddress, fingerprint) => {
+    const material = JSON.stringify({ walletAddress, fingerprint });
+    const digest = crypto.createHash('sha256').update(material).digest('hex');
+    return CACHE_KEY_PREFIX + digest;
+};
+
+const readVerdictCache = async (key) => {
+    if (!isCacheReady()) return null;
+    try {
+        const raw = await redis.get(key);
+        return raw ? JSON.parse(raw) : null;
+    } catch (err) {
+        log('warn', 'redis.get_failed', { err: err && err.message });
+        return null;
+    }
+};
+
+const writeVerdictCache = async (key, verdict) => {
+    if (!isCacheReady()) return;
+    try {
+        await redis.set(key, JSON.stringify(verdict), 'EX', CACHE_TTL_SECONDS);
+    } catch (err) {
+        log('warn', 'redis.set_failed', { err: err && err.message });
+    }
+};
 
 // In-memory limiter; swap for Redis once the gateway runs multi-instance.
 const rateBuckets = new Map();
@@ -190,32 +241,7 @@ const validateVerifyBody = (body) => {
     return null;
 };
 
-const arkadaCache = new Map();
-const ARKADA_CACHE_TTL_MS = 60_000;
-const ARKADA_CACHE_MAX = 5_000;
-
-const cacheGet = (addr) => {
-    const hit = arkadaCache.get(addr);
-    if (!hit) return null;
-    if (hit.expiresAt < Date.now()) {
-        arkadaCache.delete(addr);
-        return null;
-    }
-    return hit.value;
-};
-const cacheSet = (addr, value) => {
-    if (arkadaCache.size >= ARKADA_CACHE_MAX) {
-        // Evict oldest; Map iteration follows insertion order.
-        const firstKey = arkadaCache.keys().next().value;
-        if (firstKey !== undefined) arkadaCache.delete(firstKey);
-    }
-    arkadaCache.set(addr, { value, expiresAt: Date.now() + ARKADA_CACHE_TTL_MS });
-};
-
 const checkArkadaRank = async (walletAddress, { signal } = {}) => {
-    const cached = cacheGet(walletAddress);
-    if (cached) return cached;
-
     if (!IS_PROD) {
         const latency = Math.floor(Math.random() * 100) + 50;
         await new Promise((resolve, reject) => {
@@ -228,9 +254,7 @@ const checkArkadaRank = async (walletAddress, { signal } = {}) => {
             }
         });
         // Mock must never grant trust off attacker-controlled input.
-        const value = { isVerified: false, rank: 12, source: 'mock' };
-        cacheSet(walletAddress, value);
-        return value;
+        return { isVerified: false, rank: 12, source: 'mock' };
     }
 
     throw new Error('arkada_client_not_configured');
@@ -281,6 +305,22 @@ app.post('/api/verify', rateLimit, requireApiKey, async (req, res) => {
         ip_address: req.ip,
     };
 
+    // Key derived after IP injection so the server-observed IP is bound into
+    // the hash; a verdict computed for one source IP can never be replayed for
+    // another, preserving datacenter-IP detection across cache hits.
+    const cacheKey = verdictCacheKey(walletAddress, fingerprint);
+    const cachedVerdict = await readVerdictCache(cacheKey);
+    if (cachedVerdict) {
+        log('info', 'verify.cache_hit', {
+            reqId,
+            route: cachedVerdict.body.route,
+            durMs: Date.now() - startedAt,
+        });
+        return res
+            .status(cachedVerdict.httpStatus)
+            .json({ ...cachedVerdict.body, ref: reqId });
+    }
+
     // Race Arkada against the engine; a confident Arkada pass cancels the engine.
     const engineAbort = new AbortController();
     const arkadaAbort = new AbortController();
@@ -329,11 +369,9 @@ app.post('/api/verify', rateLimit, requireApiKey, async (req, res) => {
             rank: arkada.value.rank,
             durMs: Date.now() - startedAt,
         });
-        return res.json({
-            status: 'approved',
-            route: 'arkada_trusted',
-            ref: reqId,
-        });
+        const body = { status: 'approved', route: 'arkada_trusted' };
+        await writeVerdictCache(cacheKey, { httpStatus: 200, body });
+        return res.json({ ...body, ref: reqId });
     }
 
     const engine = await enginePromise;
@@ -361,11 +399,9 @@ app.post('/api/verify', rateLimit, requireApiKey, async (req, res) => {
             arkadaRank: arkada.ok ? arkada.value.rank : null,
             durMs: Date.now() - startedAt,
         });
-        return res.status(403).json({
-            status: 'rejected',
-            reason: 'sybil_detected',
-            ref: reqId,
-        });
+        const body = { status: 'rejected', reason: 'sybil_detected' };
+        await writeVerdictCache(cacheKey, { httpStatus: 403, body });
+        return res.status(403).json({ ...body, ref: reqId });
     }
 
     log('info', 'verify.approved', {
@@ -374,11 +410,9 @@ app.post('/api/verify', rateLimit, requireApiKey, async (req, res) => {
         risk_score: data.risk_score,
         durMs: Date.now() - startedAt,
     });
-    return res.json({
-        status: 'approved',
-        route: 'heuristics_cleared',
-        ref: reqId,
-    });
+    const body = { status: 'approved', route: 'heuristics_cleared' };
+    await writeVerdictCache(cacheKey, { httpStatus: 200, body });
+    return res.json({ ...body, ref: reqId });
 });
 
 // eslint-disable-next-line no-unused-vars
@@ -392,17 +426,22 @@ app.use((err, req, res, _next) => {
 
 // Bind a port only when run directly so test imports stay side-effect free.
 if (require.main === module) {
+    redis.connect().catch(() => {});
+
     const server = app.listen(PORT, () => {
         log('info', 'startup', {
             port: PORT,
             engine: PYTHON_ENGINE_URL,
+            redis: REDIS_URL,
             prod: IS_PROD,
         });
     });
 
     const shutdown = (sig) => {
         log('info', 'shutdown', { sig });
-        server.close(() => process.exit(0));
+        server.close(() => {
+            redis.quit().catch(() => redis.disconnect()).finally(() => process.exit(0));
+        });
         setTimeout(() => process.exit(1), 10_000).unref();
     };
     process.on('SIGTERM', () => shutdown('SIGTERM'));
