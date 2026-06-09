@@ -172,6 +172,15 @@ const ALLOWED_NESTED_KEYS = new Set([
     'network',
 ]);
 
+// Keys permitted to carry an array of flat (depth-1) objects, matching the
+// engine's Transaction/FundingSource schema. Each element is still validated
+// as primitives-only so nesting and prototype pollution stay blocked.
+const ALLOWED_OBJECT_ARRAY_KEYS = new Set([
+    'transactions',
+    'funding_sources',
+    'fundingSources',
+]);
+
 const isForbiddenKey = (k) =>
     k === '__proto__' || k === 'constructor' || k === 'prototype';
 
@@ -212,10 +221,16 @@ const validateFingerprint = (fp) => {
         if (Array.isArray(v)) {
             if (v.length > MAX_FINGERPRINT_KEYS) return 'fingerprint_array_too_long';
             for (const item of v) {
+                if (Array.isArray(item)) return 'fingerprint_nested_object';
                 if (item !== null && typeof item === 'object') {
-                    return 'fingerprint_nested_object';
-                }
-                if (typeof item === 'string' && item.length > MAX_FINGERPRINT_STRING_LEN) {
+                    // Arrays of objects are allowed only for whitelisted keys,
+                    // and each element must itself be a flat, primitives-only level.
+                    if (!ALLOWED_OBJECT_ARRAY_KEYS.has(k)) {
+                        return 'fingerprint_nested_object';
+                    }
+                    const nestedErr = validateFlatLevel(item);
+                    if (nestedErr) return nestedErr;
+                } else if (typeof item === 'string' && item.length > MAX_FINGERPRINT_STRING_LEN) {
                     return 'fingerprint_string_too_long';
                 }
             }

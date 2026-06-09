@@ -170,3 +170,46 @@ test('prototype-pollution key inside allowed sub-object is rejected', async () =
     assert.equal(res.status, 400);
     assert.equal(res.data.reason, 'invalid_input');
 });
+
+test('transactions/funding_sources arrays of flat objects pass validation', async () => {
+    const richFp = {
+        transactions: [
+            { tx_hash: '0xaaa', timestamp: '2026-01-01T10:00:00Z', value: 1.5, method: 'swap' },
+        ],
+        funding_sources: [
+            { address: '0xexchange01', amount: 5.0, timestamp: '2025-12-30T08:00:00Z', source_type: 'cex' },
+        ],
+        interaction_sequence: ['connect', 'approve', 'swap'],
+        accountAgeDays: 220,
+    };
+
+    const res = await gateway.post('/api/verify', {
+        walletAddress: VALID_WALLET,
+        fingerprint: richFp,
+    });
+
+    assert.equal(res.status, 200);
+    assert.equal(res.data.status, 'approved');
+    assert.deepEqual(lastEngineBody.fingerprint.transactions, richFp.transactions);
+    assert.deepEqual(lastEngineBody.fingerprint.funding_sources, richFp.funding_sources);
+});
+
+test('array of objects on a non-whitelisted key is rejected with 400', async () => {
+    const res = await gateway.post('/api/verify', {
+        walletAddress: VALID_WALLET,
+        fingerprint: { widgets: [{ a: 1 }] },
+    });
+
+    assert.equal(res.status, 400);
+    assert.equal(res.data.reason, 'invalid_input');
+});
+
+test('deeply nested object inside a transaction is rejected with 400', async () => {
+    const res = await gateway.post('/api/verify', {
+        walletAddress: VALID_WALLET,
+        fingerprint: { transactions: [{ meta: { deep: true } }] },
+    });
+
+    assert.equal(res.status, 400);
+    assert.equal(res.data.reason, 'invalid_input');
+});
